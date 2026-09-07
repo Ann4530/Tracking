@@ -1,0 +1,38 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# API Keys (NEVER commit)
+# Gemini key stored in localStorage - this is OK (client-side)
+# But add this to .gitignore if deploying with environment variables
+*.key
+*.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Node
+node_modules/
+package-lock.json
+
+# Build
+dist/
+build/
+*.min.js
+*.min.css
+
+# Development
+.cache/
+temp/
