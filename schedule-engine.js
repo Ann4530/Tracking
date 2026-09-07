@@ -27,6 +27,7 @@ const ScheduleEngine = {
         id: task.id,
         track: task.track,
         title: task.title,
+        docs: task.docs || "",
         output: task.output,
         priority: task.priority,
         minutes: duration,
@@ -57,13 +58,13 @@ const ScheduleEngine = {
   },
 
   // Move task within a day's schedule
-  moveTask(schedule, fromIndex, toIndex) {
+  moveTask(schedule, fromIndex, toIndex, settings = {}) {
     const newSchedule = [...schedule];
     const [task] = newSchedule.splice(fromIndex, 1);
     newSchedule.splice(toIndex, 0, task);
     
     // Recalculate times
-    return this.recalculateTimes(newSchedule);
+    return this.recalculateTimes(newSchedule, settings);
   },
 
   // Recalculate all task times after reordering
@@ -81,6 +82,52 @@ const ScheduleEngine = {
       currentTime += task.minutes + breakDuration;
       return updated;
     });
+  },
+
+  // Update a single task and cascade the remaining timeline forward
+  updateTaskAt(schedule, index, updates = {}, settings = {}) {
+    const newSchedule = schedule.map(task => ({ ...task }));
+    if (!newSchedule[index]) return newSchedule;
+
+    const task = newSchedule[index];
+    if (updates.minutes !== undefined) {
+      task.minutes = Math.max(5, Number(updates.minutes) || task.minutes);
+    }
+    if (updates.startTime) {
+      task.startTime = updates.startTime;
+    }
+
+    return this.recalculateFrom(newSchedule, index, settings, updates.startTime || null);
+  },
+
+  // Recalculate from a given index after a duration or time edit
+  recalculateFrom(schedule, startIndex = 0, settings = {}, forcedStartTime = null) {
+    const wake = settings.wake || "06:30";
+    const breakDuration = parseInt(settings.break || "30");
+    const cloned = schedule.map(task => ({ ...task }));
+
+    if (!cloned.length) return cloned;
+
+    let currentTime;
+    if (forcedStartTime) {
+      currentTime = this.timeToMinutes(forcedStartTime);
+    } else if (startIndex <= 0) {
+      const [wakeHour, wakeMin] = wake.split(":").map(Number);
+      currentTime = wakeHour * 60 + wakeMin;
+    } else {
+      const prev = cloned[startIndex - 1];
+      currentTime = this.timeToMinutes(prev.endTime) + breakDuration;
+    }
+
+    for (let i = startIndex; i < cloned.length; i++) {
+      const task = cloned[i];
+      const startTime = this.minutesToTime(currentTime);
+      const endTime = this.minutesToTime(currentTime + task.minutes);
+      cloned[i] = { ...task, startTime, endTime };
+      currentTime += task.minutes + breakDuration;
+    }
+
+    return cloned;
   },
 
   // Check for time conflicts
