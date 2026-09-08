@@ -12,7 +12,10 @@ const ScheduleEngine = {
     let currentTime = wakeHour * 60 + wakeMin; // in minutes from midnight
     
     const schedule = [];
-    let taskOrder = tasks.map(t => ({ ...t, id: `${dayNumber}-${t.track}` }));
+    let taskOrder = tasks.map((t, index) => ({
+      ...t,
+      id: t.id || `${dayNumber}-${t.track || "custom"}-${index + 1}`
+    }));
     
     // Priority sort: P0 > P1 > P2
     const priorityValue = { P0: 3, P1: 2, P2: 1 };

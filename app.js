@@ -343,6 +343,8 @@ function safeLoad() {
 let saved = safeLoad();
 const key = (d, t) => `${Number(d)}-${t}`;
 const validKey = (k, t) => new RegExp(`^([1-9]|1[0-9]|2[0-8])-${t}$`).test(k);
+const taskId = (day, task, index = 0) => task.id || `${Number(day)}-${task.track || "custom"}-${index}`;
+const isReviewTask = task => (task && task.track) === "review";
 function persist() { try { localStorage.setItem("sprint28", JSON.stringify(saved)); } catch (_) { /* private mode */ } }
 function dateForDay(d) { const date = new Date(`${saved.start}T00:00:00`); date.setDate(date.getDate() + Number(d) - 1); return date; }
 function isoDate(date) { return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-"); }
@@ -358,6 +360,7 @@ function dayData(d) {
   const tasks = Object.keys(tracks).map(t => {
     const custom = saved.taskEdits?.[day]?.[t] || {};
     return {
+      id: `${day}-${t}`,
       track: t,
       title: custom.title || masterTaskVi[t][day - 1],
       docs: custom.docs || taskDocsFor(t, day),
@@ -366,13 +369,56 @@ function dayData(d) {
       priority: day % 7 === 1 || day >= 25 ? "P0" : day % 7 <= 3 ? "P1" : "P2"
     };
   });
-  const review = { ...reviewTask, title: `${reviewTask.title} · Day ${String(day).padStart(2, "0")}`, output: `${reviewTask.output} · day-${String(day).padStart(2, "0")}` };
+  const review = { ...reviewTask, id: `${day}-review`, title: `${reviewTask.title} · Day ${String(day).padStart(2, "0")}`, output: `${reviewTask.output} · day-${String(day).padStart(2, "0")}` };
   return { d: day, week, idx: day - 1, date: dateForDay(day), weekday: dateLabel(day), tasks: [...tasks, review] };
 }
-function allTasks() { return 28 * (Object.keys(tracks).length + 1); }
-function completedCount() { return Object.keys(saved.completed).filter(k => saved.completed[k] && /^([1-9]|1[0-9]|2[0-8])-(se|ai|ielts|app|channel|jobs|review)$/.test(k)).length; }
+function normalizeSchedule(day, schedule) {
+  const dayNum = Math.max(1, Math.min(28, Number(day) || 1));
+  const base = Array.isArray(schedule) ? schedule.map((task, index) => ({
+    ...task,
+    id: task.id || `${dayNum}-${task.track || "custom"}-${index + 1}`,
+    track: task.track || "se",
+    minutes: Math.max(5, Number(task.minutes) || 0)
+  })) : [];
+  const reviewIndex = base.findIndex(task => task.track === "review");
+  const review = reviewIndex >= 0 ? base.splice(reviewIndex, 1)[0] : null;
+  return [...base, ...(review ? [review] : [])];
+}
+function getDaySchedule(d) {
+  const day = Math.max(1, Math.min(28, Number(d) || 1));
+  const stored = saved.schedule?.[day];
+  if (Array.isArray(stored) && stored.length) return normalizeSchedule(day, stored);
+  return ScheduleEngine.generateDaySchedule(day, dayData(day).tasks, saved.settings);
+}
+function saveDaySchedule(day, schedule) {
+  const dayNum = Math.max(1, Math.min(28, Number(day) || 1));
+  saved.schedule[dayNum] = normalizeSchedule(dayNum, schedule);
+}
+function taskKey(task, day, index = 0) { return taskId(day, task, index); }
+function completedForTask(task, day, index = 0) {
+  const id = taskKey(task, day, index);
+  if (saved.completed[id] !== undefined) return !!saved.completed[id];
+  return !!saved.completed[key(day, task.track)];
+}
+function minutesForTask(task, day, index = 0) {
+  const id = taskKey(task, day, index);
+  if (saved.minutes[id] !== undefined) return Math.max(0, Number(saved.minutes[id]) || 0);
+  return Math.max(0, Number(saved.minutes[key(day, task.track)]) || 0);
+}
+function evidenceForTask(task, day, index = 0) {
+  const id = taskKey(task, day, index);
+  return saved.evidence[id] ?? saved.evidence[key(day, task.track)] ?? "";
+}
+function allTasks() { return Array.from({ length: 28 }, (_, i) => getDaySchedule(i + 1).length).reduce((n, v) => n + v, 0); }
+function completedCount() {
+  return Array.from({ length: 28 }, (_, i) => {
+    const day = i + 1;
+    return getDaySchedule(day).filter((task, index) => !isReviewTask(task) && completedForTask(task, day, index)).length;
+  }).reduce((n, v) => n + v, 0);
+}
 function minsFor(t, d = null) {
-  return Object.keys(saved.minutes).filter(k => validKey(k, t) && (d === null || Number(k.split("-")[0]) === d)).reduce((n, k) => n + Math.max(0, Number(saved.minutes[k]) || 0), 0);
+  const days = d === null ? Array.from({ length: 28 }, (_, i) => i + 1) : [Number(d) || 1];
+  return days.reduce((sum, day) => sum + getDaySchedule(day).reduce((n, task, index) => n + (task.track === t ? minutesForTask(task, day, index) : 0), 0), 0);
 }
 function outcomeValue(t) { return t === "app" ? saved.users : t === "channel" ? saved.subs : t === "jobs" ? saved.interviews : Math.round(minsFor(t) / 60 * 10) / 10; }
 function trackProgress(t) {
@@ -381,9 +427,16 @@ function trackProgress(t) {
 }
 function reviewForDay(d) { return saved.reviews.daily[d] || {}; }
 function trackDayScore(t, d) {
-  if (t === "se" || t === "ai" || t === "ielts") return Math.min(100, Math.round(minsFor(t, d) / dayData(d).tasks.find(x => x.track === t).minutes * 100));
+  if (t === "se" || t === "ai" || t === "ielts") {
+    const tasks = getDaySchedule(d).filter(x => x.track === t);
+    const planned = tasks.reduce((n, task) => n + Number(task.minutes || 0), 0) || 1;
+    const actual = tasks.reduce((n, task, index) => n + minutesForTask(task, d, index), 0);
+    return Math.min(100, Math.round(actual / planned * 100));
+  }
   const recorded = saved.outcomesByDay[d] && saved.outcomesByDay[d][t];
-  return recorded === undefined ? (saved.completed[key(d, t)] ? 100 : 0) : Math.min(100, Math.max(0, Number(recorded) || 0));
+  if (recorded !== undefined) return Math.min(100, Math.max(0, Number(recorded) || 0));
+  const tasks = getDaySchedule(d).filter(x => x.track === t);
+  return tasks.some((task, index) => completedForTask(task, d, index)) ? 100 : 0;
 }
 function dayScore(d) {
   const weightTotal = Object.values(saved.weights).reduce((n, value) => n + Math.max(0, Number(value) || 0), 0) || 1;
@@ -406,42 +459,63 @@ function goalsHtml() {
   }).join("");
 }
 function taskHtml(t, d = saved.selectedDay) {
-  const done = !!saved.completed[key(d, t.track)]; const evidence = saved.evidence[key(d, t.track)] || "";
+  const done = completedForTask(t, d); const evidence = evidenceForTask(t, d);
   const meta = tracks[t.track] || { label: "Daily review", short: "REVIEW" };
-  return `<div class="task-line ${done ? "done" : ""}"><button class="check ${done ? "done" : ""}" data-task="${t.track}">${done ? "✓" : ""}</button><div class="task-text"><div class="task-title-row"><span class="task-name">${t.title}</span><span class="task-time">${t.minutes} phút</span></div><div class="task-track"><span class="track-dot ${t.track}"></span>${meta.label}</div><div class="task-docs">Tài liệu: ${t.docs || "Mẫu review ngày"}</div><div class="task-output">Kết quả cần nộp: ${t.output}</div><input class="input evidence-input" data-evidence="${t.track}" value="${evidence}" placeholder="Ghi evidence hoặc ghi chú (không bắt buộc)"></div></div>`;
+  return `<div class="task-line ${done ? "done" : ""}"><button class="check ${done ? "done" : ""}" data-task="${taskKey(t, d)}">${done ? "✓" : ""}</button><div class="task-text"><div class="task-title-row"><span class="task-name">${t.title}</span><span class="task-time">${t.minutes} phút</span></div><div class="task-track"><span class="track-dot ${t.track}"></span><span class="task-tag">${meta.short}</span> ${meta.label}</div><div class="task-docs">Tài liệu: ${t.docs || "Mẫu review ngày"}</div><div class="task-output">Kết quả cần nộp: ${t.output}</div><input class="input evidence-input" data-evidence="${taskKey(t, d)}" value="${evidence}" placeholder="Ghi evidence hoặc ghi chú (không bắt buộc)"></div></div>`;
 }
 function trackCards() {
   return Object.entries(tracks).map(([t, x]) => {
-    const count = Object.keys(saved.completed).filter(k => validKey(k, t) && saved.completed[k]).length, p = trackProgress(t);
+    const count = Array.from({ length: 28 }, (_, i) => {
+      const day = i + 1;
+      return getDaySchedule(day).filter((task, index) => task.track === t && completedForTask(task, day, index)).length;
+    }).reduce((n, v) => n + v, 0);
+    const p = trackProgress(t);
     return `<div class="track-card"><div class="track-head"><span class="track-dot ${t}"></span>${x.short}<span style="margin-left:auto;color:var(--faint)">${x.icon}</span></div><div class="track-hours">${fmt(outcomeValue(t))} <small>${x.unit}</small></div><div class="bar ${x.color}"><i style="width:${p}%"></i></div><div class="track-foot"><span>${p}% outcome pace</span><span>${count} outputs</span></div></div>`;
   }).join("");
 }
 function timeline(d = saved.selectedDay) {
   const start = saved.settings.wake || "06:30"; const [h, m] = start.split(":").map(Number); let cursor = (h * 60 + (m || 0)) % 1440;
-  return dayData(d).tasks.map(t => { const hh = String(Math.floor(cursor / 60) % 24).padStart(2, "0"), mm = String(cursor % 60).padStart(2, "0"); const meta = tracks[t.track] || { short: "ÔN LẠI" }; cursor += t.minutes + Number(saved.settings.break || 30); return `<div class="timeline"><div class="timeline-hour">${hh}:${mm}</div><div class="timeline-entry ${t.track}"><b>${meta.short} · ${t.title}</b><small>Tài liệu: ${t.docs || "Mẫu review ngày"}</small><small>${t.minutes} phút · mức ${t.priority}</small></div></div>`; }).join("");
+  return getDaySchedule(d).map((t, index) => { const hh = String(Math.floor(cursor / 60) % 24).padStart(2, "0"), mm = String(cursor % 60).padStart(2, "0"); const meta = tracks[t.track] || { short: "ÔN LẠI" }; cursor += t.minutes + Number(saved.settings.break || 30); return `<div class="timeline"><div class="timeline-hour">${hh}:${mm}</div><div class="timeline-entry ${t.track}"><b>${meta.short} · ${t.title}</b><small>Tài liệu: ${t.docs || "Mẫu review ngày"}</small><small>${t.minutes} phút · mức ${t.priority}${isReviewTask(t) ? "" : ` · #${index + 1}`}</small></div></div>`; }).join("");
 }
 function dashboard() {
   const d = saved.selectedDay, p = overallPercent(), status = statusFor(p), date = dateLabel(d, true);
-  return `<div class="view"><div class="hero"><div><div class="eyebrow">${date.toUpperCase()} · ${dayData(d).weekday.toUpperCase()}</div><h1>Good morning, Phương Anh.</h1><p>Six workstreams. One focused sprint. Keep the inputs honest.</p></div><div class="hero-right"><div class="date">DAY ${String(d).padStart(2, "0")} OF 28 · ${date}</div><span class="status-pill ${status === "AT RISK" ? "status-risk" : status === "BEHIND" ? "status-behind" : status === "AHEAD" ? "status-ahead" : ""}">${status}</span></div></div><div class="metric-row"><div class="metric"><div class="metric-top"><span>SPRINT PROGRESS</span><span class="metric-icon">◒</span></div><div class="metric-value">${p}<small>%</small></div><div class="metric-foot"><span class="up">↑ ${completedCount()}</span> completed outputs</div></div><div class="metric"><div class="metric-top"><span>TODAY'S SCORE</span><span class="metric-icon">✦</span></div><div class="metric-value">${dayScore(d)}<small> / 100</small></div><div class="metric-foot">${dayScore(d) >= 70 ? '<span class="up">On pace</span>' : '<span class="down">Needs attention</span>'}</div></div><div class="metric"><div class="metric-top"><span>FOCUSED HOURS</span><span class="metric-icon">◷</span></div><div class="metric-value">${Math.round(Object.values(saved.minutes).reduce((a, b) => a + Number(b || 0), 0) / 60 * 10) / 10}<small> h</small></div><div class="metric-foot">Logged minutes · target <span class="up">~320 h</span></div></div><div class="metric"><div class="metric-top"><span>SPRINT DAY</span><span class="metric-icon">↗</span></div><div class="metric-value">${d}<small> / 28</small></div><div class="metric-foot">${dayData(d).weekday} · ends ${endDate()}</div></div></div><div class="grid-2"><section class="card goals-card"><div class="card-head"><div><div class="card-title">North star goals</div><div class="card-sub">Logged minutes and actual outcomes against targets</div></div><button class="link-btn" data-view="analytics">View analytics ↗</button></div>${goalsHtml()}</section><section class="card today-card"><div class="card-head"><div><div class="card-title">Today · Day ${String(d).padStart(2, "0")}</div><div class="card-sub">${dayData(d).weekday} · ${dayTopics[dayData(d).week - 1]}</div></div><div class="day-switch"><button data-day="-1">‹</button><button data-day="1">›</button></div></div>${dayData(d).tasks.slice(0, 5).map(t => taskHtml(t)).join("")}<button class="link-btn" style="margin-top:12px" data-view="today">View all tasks ↗</button></section></div><div class="section-title">Parallel execution · outcome KPIs</div><div class="track-grid">${trackCards()}</div><div class="bottom-grid"><section class="card"><div class="card-head"><div><div class="card-title">Today's schedule</div><div class="card-sub">Dynamic blocks · protect the sleep window</div></div><button class="link-btn" data-view="settings">Edit schedule</button></div>${timeline()}</section><section class="card"><div class="card-head"><div><div class="card-title">Sprint signal</div><div class="card-sub">The one thing to protect today</div></div><span class="badge">${dayData(d).tasks[0].priority} PRIORITY</span></div><div class="callout"><b>Start with evidence.</b><br/>Log actual minutes and outcomes; then adapt the next day rather than repeating a generic week.</div><div class="stat-list"><div class="stat-line"><span>Outputs completed</span><b>${completedCount()} / ${allTasks()}</b></div><div class="stat-line"><span>Applications → interviews</span><b>${saved.applications} → ${saved.interviews}</b></div><div class="stat-line"><span>Channel subscribers</span><b>${fmt(saved.subs)} / 1,000</b></div></div></section></div></div>`;
+  const dayPlan = getDaySchedule(d);
+  return `<div class="view"><div class="hero"><div><div class="eyebrow">${date.toUpperCase()} · ${dayData(d).weekday.toUpperCase()}</div><h1>Good morning, Phương Anh.</h1><p>Six workstreams. One focused sprint. Keep the inputs honest.</p></div><div class="hero-right"><div class="date">DAY ${String(d).padStart(2, "0")} OF 28 · ${date}</div><span class="status-pill ${status === "AT RISK" ? "status-risk" : status === "BEHIND" ? "status-behind" : status === "AHEAD" ? "status-ahead" : ""}">${status}</span></div></div><div class="metric-row"><div class="metric"><div class="metric-top"><span>SPRINT PROGRESS</span><span class="metric-icon">◒</span></div><div class="metric-value">${p}<small>%</small></div><div class="metric-foot"><span class="up">↑ ${completedCount()}</span> completed outputs</div></div><div class="metric"><div class="metric-top"><span>TODAY'S SCORE</span><span class="metric-icon">✦</span></div><div class="metric-value">${dayScore(d)}<small> / 100</small></div><div class="metric-foot">${dayScore(d) >= 70 ? '<span class="up">On pace</span>' : '<span class="down">Needs attention</span>'}</div></div><div class="metric"><div class="metric-top"><span>FOCUSED HOURS</span><span class="metric-icon">◷</span></div><div class="metric-value">${Math.round(Object.values(saved.minutes).reduce((a, b) => a + Number(b || 0), 0) / 60 * 10) / 10}<small> h</small></div><div class="metric-foot">Logged minutes · target <span class="up">~320 h</span></div></div><div class="metric"><div class="metric-top"><span>SPRINT DAY</span><span class="metric-icon">↗</span></div><div class="metric-value">${d}<small> / 28</small></div><div class="metric-foot">${dayData(d).weekday} · ends ${endDate()}</div></div></div><div class="grid-2"><section class="card goals-card"><div class="card-head"><div><div class="card-title">North star goals</div><div class="card-sub">Logged minutes and actual outcomes against targets</div></div><button class="link-btn" data-view="analytics">View analytics ↗</button></div>${goalsHtml()}</section><section class="card today-card"><div class="card-head"><div><div class="card-title">Today · Day ${String(d).padStart(2, "0")}</div><div class="card-sub">${dayData(d).weekday} · ${dayTopics[dayData(d).week - 1]}</div></div><div class="day-switch"><button data-day="-1">‹</button><button data-day="1">›</button></div></div>${dayPlan.slice(0, 5).map(t => taskHtml(t)).join("")}<button class="link-btn" style="margin-top:12px" data-view="today">View all tasks ↗</button></section></div><div class="section-title">Parallel execution · outcome KPIs</div><div class="track-grid">${trackCards()}</div><div class="bottom-grid"><section class="card"><div class="card-head"><div><div class="card-title">Today's schedule</div><div class="card-sub">Dynamic blocks · protect the sleep window</div></div><button class="link-btn" data-view="settings">Edit schedule</button></div>${timeline()}</section><section class="card"><div class="card-head"><div><div class="card-title">Sprint signal</div><div class="card-sub">The one thing to protect today</div></div><span class="badge">${dayPlan[0].priority} PRIORITY</span></div><div class="callout"><b>Start with evidence.</b><br/>Log actual minutes and outcomes; then adapt the next day rather than repeating a generic week.</div><div class="stat-list"><div class="stat-line"><span>Outputs completed</span><b>${completedCount()} / ${allTasks()}</b></div><div class="stat-line"><span>Applications → interviews</span><b>${saved.applications} → ${saved.interviews}</b></div><div class="stat-line"><span>Channel subscribers</span><b>${fmt(saved.subs)} / 1,000</b></div></div></section></div></div>`;
 }
 function today() {
   const d = saved.selectedDay; const review = reviewForDay(d);
-  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">EXECUTION LOG · ${dayData(d).weekday.toUpperCase()}</div><h1>Today · Day ${String(d).padStart(2, "0")}</h1><p>Check off only when the measurable output exists. Sprint date: ${isoDate(dayData(d).date)}.</p></div><div><span class="status-pill ${dayScore(d) < 60 ? "status-risk" : ""}">${dayScore(d)} / 100</span></div></div><div class="card"><div class="card-head"><div><div class="card-title">Seven execution groups</div><div class="card-sub">Every task now shows the time block, docs, output, and evidence note in one place.</div></div><div class="day-switch"><button data-day="-1">‹</button><span class="eyebrow">DAY ${d} / 28</span><button data-day="1">›</button></div></div>${dayData(d).tasks.map(t => { const done = !!saved.completed[key(d, t.track)], min = saved.minutes[key(d, t.track)] || "", meta = tracks[t.track] || { label: "Daily review" }; return `<div class="task-line ${done ? "done" : ""}" style="grid-template-columns:20px 72px 1fr 88px 72px"><button class="check ${done ? "done" : ""}" data-task="${t.track}">${done ? "✓" : ""}</button><span class="badge ${t.priority === "P0" ? "warn" : ""}">${t.priority}</span><div class="task-text"><div class="task-title-row"><span class="task-name">${t.title}</span><span class="task-time">EST. ${t.minutes}m</span></div><div class="task-track"><span class="track-dot ${t.track}"></span>${meta.label}</div><div class="task-docs">${t.docs}</div><div class="task-output">Output · ${t.output}</div><input class="input evidence-input" data-evidence="${t.track}" value="${saved.evidence[key(d, t.track)] || ""}" placeholder="Evidence / note"></div><input class="input minutes-input" data-minutes="${t.track}" value="${min}" placeholder="Actual min" type="number" min="0"><span class="task-time">EST. ${t.minutes}m</span></div>`; }).join("")}</div><div class="bottom-grid"><section class="card"><div class="card-head"><div><div class="card-title">Daily review · Day ${d}</div><div class="card-sub">Persisted for every day; review adds the normalized 5-point score.</div></div><span class="badge blue">5 POINTS</span></div><div class="form-grid"><div class="form-field"><label>ENERGY / 10</label><input class="input review-input" data-review="energy" type="number" min="1" max="10" value="${review.energy || ""}" placeholder="8"></div><div class="form-field"><label>FOCUS / 10</label><input class="input review-input" data-review="focus" type="number" min="1" max="10" value="${review.focus || ""}" placeholder="7"></div><div class="form-field full"><label>BIGGEST WIN</label><textarea class="textarea review-input" data-review="win" placeholder="What moved a goal forward?">${review.win || ""}</textarea></div><div class="form-field full"><label>WHAT SHOULD CHANGE TOMORROW?</label><textarea class="textarea review-input" data-review="change" placeholder="One concrete adjustment">${review.change || ""}</textarea></div></div><button class="settings-save" data-save-review>Save review</button></section><section class="card"><div class="card-head"><div><div class="card-title">Schedule guardrails</div><div class="card-sub">A sustainable default, not a mandate.</div></div></div>${timeline(d)}<div class="callout"><b>Sleep window:</b> ${saved.settings.sleep} → ${saved.settings.wake} (${sleepHours()}h). If the plan slips, reduce scope before reducing sleep.</div></section></div></div>`;
+  const dayPlan = getDaySchedule(d);
+  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">EXECUTION LOG · ${dayData(d).weekday.toUpperCase()}</div><h1>Today · Day ${String(d).padStart(2, "0")}</h1><p>Check off only when the measurable output exists. Sprint date: ${isoDate(dayData(d).date)}.</p></div><div><span class="status-pill ${dayScore(d) < 60 ? "status-risk" : ""}">${dayScore(d)} / 100</span></div></div><div class="card"><div class="card-head"><div><div class="card-title">Seven execution groups</div><div class="card-sub">Every task now shows the time block, docs, output, and evidence note in one place.</div></div><div class="day-switch"><button data-day="-1">‹</button><span class="eyebrow">DAY ${d} / 28</span><button data-day="1">›</button></div></div>${dayPlan.map((t, i) => { const done = completedForTask(t, d, i), min = minutesForTask(t, d, i) || "", meta = tracks[t.track] || { label: "Daily review" }; return `<div class="task-line ${done ? "done" : ""}" style="grid-template-columns:20px 72px 1fr 88px 72px"><button class="check ${done ? "done" : ""}" data-task="${taskKey(t, d, i)}">${done ? "✓" : ""}</button><span class="badge ${t.priority === "P0" ? "warn" : ""}">${t.priority}</span><div class="task-text"><div class="task-title-row"><span class="task-name">${t.title}</span><span class="task-time">EST. ${t.minutes}m</span></div><div class="task-track"><span class="track-dot ${t.track}"></span><span class="task-tag">${meta.short}</span> ${meta.label}</div><div class="task-docs">${t.docs}</div><div class="task-output">Output · ${t.output}</div><input class="input evidence-input" data-evidence="${taskKey(t, d, i)}" value="${evidenceForTask(t, d, i)}" placeholder="Evidence / note"></div><input class="input minutes-input" data-minutes="${taskKey(t, d, i)}" value="${min}" placeholder="Actual min" type="number" min="0"><span class="task-time">EST. ${t.minutes}m</span></div>`; }).join("")}</div><div class="bottom-grid"><section class="card"><div class="card-head"><div><div class="card-title">Daily review · Day ${d}</div><div class="card-sub">Persisted for every day; review adds the normalized 5-point score.</div></div><span class="badge blue">5 POINTS</span></div><div class="form-grid"><div class="form-field"><label>ENERGY / 10</label><input class="input review-input" data-review="energy" type="number" min="1" max="10" value="${review.energy || ""}" placeholder="8"></div><div class="form-field"><label>FOCUS / 10</label><input class="input review-input" data-review="focus" type="number" min="1" max="10" value="${review.focus || ""}" placeholder="7"></div><div class="form-field full"><label>BIGGEST WIN</label><textarea class="textarea review-input" data-review="win" placeholder="What moved a goal forward?">${review.win || ""}</textarea></div><div class="form-field full"><label>WHAT SHOULD CHANGE TOMORROW?</label><textarea class="textarea review-input" data-review="change" placeholder="One concrete adjustment">${review.change || ""}</textarea></div></div><button class="settings-save" data-save-review>Save review</button></section><section class="card"><div class="card-head"><div><div class="card-title">Schedule guardrails</div><div class="card-sub">A sustainable default, not a mandate.</div></div></div>${timeline(d)}<div class="callout"><b>Sleep window:</b> ${saved.settings.sleep} → ${saved.settings.wake} (${sleepHours()}h). If the plan slips, reduce scope before reducing sleep.</div></section></div></div>`;
 }
 function sleepHours() { const [sh, sm] = saved.settings.sleep.split(":").map(Number), [wh, wm] = saved.settings.wake.split(":").map(Number); return Math.round((((wh * 60 + wm) - (sh * 60 + sm) + 1440) % 1440) / 60 * 10) / 10; }
 function calendar() {
   const offset = (dateForDay(1).getDay() + 6) % 7;
   const emptyCells = Array.from({ length: offset }, () => '<div class="cal-day muted" aria-hidden="true"></div>').join("");
-  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">ROADMAP · ${saved.start} → ${endDate()}</div><h1>28-day calendar</h1><p>Every day has seven distinct records, including REVIEW. Weekdays are derived from the sprint start date.</p></div><button class="outline-btn" data-view="today">Open selected day ↗</button></div><div class="card"><div class="calendar-grid">${["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"].map(x => `<div class="cal-head">${x}</div>`).join("")}${emptyCells}${Array.from({ length: 28 }, (_, i) => { const d = i + 1, p = dayScore(d), done = dayData(d).tasks.filter(t => saved.completed[key(d, t.track)]).length; return `<div class="cal-day ${saved.selectedDay === d ? "selected" : ""}" data-select-day="${d}"><span class="cal-num">${String(d).padStart(2, "0")}</span><span class="cal-score">${p || "—"}</span><div class="cal-bars">${Object.keys(tracks).map(t => `<i class="${saved.completed[key(d, t.track)] ? "filled" : ""} ${t}"></i>`).join("")}  </div><small>${done}/7 records · ${dayData(d).weekday.slice(0, 3)}</small></div>`; }).join("")}</div></div><div class="section-title">Roadmap detail · all 28 days</div><div class="day-list">${Array.from({ length: 28 }, (_, i) => { const d = i + 1, done = dayData(d).tasks.filter(t => saved.completed[key(d, t.track)]).length; return `<div class="day-row"><span class="day-num">DAY ${String(d).padStart(2, "0")}</span><div><b>${dayTopics[Math.floor(i / 7)]} · ${dayData(d).weekday}</b><small>${dayData(d).tasks[0].title}</small></div><div class="progress-mini"><i style="width:${done / 6 * 100}%"></i></div><span class="day-score">${done}/6 · ${dayScore(d)}</span></div>`; }).join("")}</div></div>`;
+  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">ROADMAP · ${saved.start} → ${endDate()}</div><h1>28-day calendar</h1><p>Every day has seven distinct records, including REVIEW. Weekdays are derived from the sprint start date.</p></div><button class="outline-btn" data-view="today">Open selected day ↗</button></div><div class="card"><div class="calendar-grid">${["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"].map(x => `<div class="cal-head">${x}</div>`).join("")}${emptyCells}${Array.from({ length: 28 }, (_, i) => { const d = i + 1, p = dayScore(d), daySchedule = getDaySchedule(d), done = daySchedule.filter((t, index) => !isReviewTask(t) && completedForTask(t, d, index)).length; return `<div class="cal-day ${saved.selectedDay === d ? "selected" : ""}" data-select-day="${d}"><span class="cal-num">${String(d).padStart(2, "0")}</span><span class="cal-score">${p || "—"}</span><div class="cal-bars">${Object.keys(tracks).map(t => `<i class="${daySchedule.some((task, index) => task.track === t && completedForTask(task, d, index)) ? "filled" : ""} ${t}"></i>`).join("")}  </div><small>${done}/${daySchedule.length} records · ${dayData(d).weekday.slice(0, 3)}</small></div>`; }).join("")}</div></div><div class="section-title">Roadmap detail · all 28 days</div><div class="day-list">${Array.from({ length: 28 }, (_, i) => { const d = i + 1, daySchedule = getDaySchedule(d), done = daySchedule.filter((t, index) => !isReviewTask(t) && completedForTask(t, d, index)).length, planned = Math.max(1, daySchedule.length - 1); return `<div class="day-row"><span class="day-num">DAY ${String(d).padStart(2, "0")}</span><div><b>${dayTopics[Math.floor(i / 7)]} · ${dayData(d).weekday}</b><small>${daySchedule[0].title}</small></div><div class="progress-mini"><i style="width:${done / planned * 100}%"></i></div><span class="day-score">${done}/${planned} · ${dayScore(d)}</span></div>`; }).join("")}</div></div>`;
 }
 function trackPage(t) {
-  const x = tracks[t], target = Number(saved.targets[t]) || x.target, p = trackProgress(t), count = Object.keys(saved.completed).filter(k => validKey(k, t) && saved.completed[k]).length;
-  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">WORKSTREAM · ${x.short}</div><h1>${x.label}</h1><p>${t === "se" || t === "ai" ? "Logged minutes are the input; every session ships an artifact." : t === "ielts" ? "Editable per-skill bands and logged practice, never a proxy." : t === "channel" ? "Actual video and subscriber growth, not intentions." : t === "jobs" ? "Applications are inputs; responses, screenings, interviews, and offers are outcomes." : "Ship, test, submit, and learn from real users."}</p></div><span class="status-pill ${p < 35 ? "status-risk" : ""}">${statusFor(p)}</span></div><div class="track-page-grid"><section class="card"><div class="card-head"><div><div class="card-title">Outcome KPI</div><div class="card-sub">Actual vs target · Day ${saved.selectedDay}</div></div><span class="badge ${p < 35 ? "warn" : "blue"}">${p}%</span></div><div class="kpi-big"><strong>${fmt(outcomeValue(t))}</strong><span>/ ${fmt(target)} ${x.unit}</span></div><div class="bar ${x.color}" style="margin:18px 0 24px"><i style="width:${p}%"></i></div><div class="stat-list"><div class="stat-line"><span>Target</span><b>${fmt(target)} ${x.unit}</b></div><div class="stat-line"><span>Days remaining</span><b>${28 - saved.selectedDay}</b></div><div class="stat-line"><span>Outputs completed</span><b>${count} / 28</b></div></div></section><section class="card"><div class="card-head"><div><div class="card-title">Input pace · 28 days</div><div class="card-sub">Data from logged minutes or outcome records</div></div></div><div class="chart">${Array.from({ length: 28 }, (_, i) => `<div class="chart-col"><i style="height:${Math.max(4, trackDayScore(t, i + 1))}%"></i></div>`).join("")}</div><div class="chart-labels"><span>WEEK 01</span><span>WEEK 02</span><span>WEEK 03</span><span>WEEK 04</span></div></section></div>${t === "ielts" ? ieltsEditor() : ""}${t === "app" || t === "channel" || t === "jobs" ? outcomeEditor(t) : ""}<div class="section-title">All 28 planned records</div><div class="card"><table class="table"><thead><tr><th>DAY</th><th>ACTION</th><th>EXPECTED OUTPUT</th><th>TIME</th><th>STATUS</th></tr></thead><tbody>${Array.from({ length: 28 }, (_, i) => { const d = i + 1, task = dayData(d).tasks.find(z => z.track === t), done = saved.completed[key(d, t)]; return `<tr><td>DAY ${String(d).padStart(2, "0")} · ${dayData(d).weekday.slice(0, 3)}</td><td>${task.title}</td><td>${task.output}</td><td>${task.minutes}m</td><td><span class="badge ${done ? "" : "gray"}">${done ? "COMPLETE" : "PLANNED"}</span></td></tr>`; }).join("")}</tbody></table></div></div>`;
+  const x = tracks[t], target = Number(saved.targets[t]) || x.target, p = trackProgress(t), count = Array.from({ length: 28 }, (_, i) => {
+    const day = i + 1;
+    return getDaySchedule(day).filter((task, index) => task.track === t && completedForTask(task, day, index)).length;
+  }).reduce((n, v) => n + v, 0);
+  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">WORKSTREAM · ${x.short}</div><h1>${x.label}</h1><p>${t === "se" || t === "ai" ? "Logged minutes are the input; every session ships an artifact." : t === "ielts" ? "Editable per-skill bands and logged practice, never a proxy." : t === "channel" ? "Actual video and subscriber growth, not intentions." : t === "jobs" ? "Applications are inputs; responses, screenings, interviews, and offers are outcomes." : "Ship, test, submit, and learn from real users."}</p></div><span class="status-pill ${p < 35 ? "status-risk" : ""}">${statusFor(p)}</span></div><div class="track-page-grid"><section class="card"><div class="card-head"><div><div class="card-title">Outcome KPI</div><div class="card-sub">Actual vs target · Day ${saved.selectedDay}</div></div><span class="badge ${p < 35 ? "warn" : "blue"}">${p}%</span></div><div class="kpi-big"><strong>${fmt(outcomeValue(t))}</strong><span>/ ${fmt(target)} ${x.unit}</span></div><div class="bar ${x.color}" style="margin:18px 0 24px"><i style="width:${p}%"></i></div><div class="stat-list"><div class="stat-line"><span>Target</span><b>${fmt(target)} ${x.unit}</b></div><div class="stat-line"><span>Days remaining</span><b>${28 - saved.selectedDay}</b></div><div class="stat-line"><span>Outputs completed</span><b>${count} / 28</b></div></div></section><section class="card"><div class="card-head"><div><div class="card-title">Input pace · 28 days</div><div class="card-sub">Data from logged minutes or outcome records</div></div></div><div class="chart">${Array.from({ length: 28 }, (_, i) => `<div class="chart-col"><i style="height:${Math.max(4, trackDayScore(t, i + 1))}%"></i></div>`).join("")}</div><div class="chart-labels"><span>WEEK 01</span><span>WEEK 02</span><span>WEEK 03</span><span>WEEK 04</span></div></section></div>${t === "ielts" ? ieltsEditor() : ""}${t === "app" || t === "channel" || t === "jobs" ? outcomeEditor(t) : ""}<div class="section-title">All 28 planned records</div><div class="card"><table class="table"><thead><tr><th>DAY</th><th>ACTION</th><th>EXPECTED OUTPUT</th><th>TIME</th><th>STATUS</th></tr></thead><tbody>${Array.from({ length: 28 }, (_, i) => { const d = i + 1, daySchedule = getDaySchedule(d), task = daySchedule.find(z => z.track === t), taskIndex = daySchedule.findIndex(z => z.track === t), done = task ? completedForTask(task, d, taskIndex) : false; return `<tr><td>DAY ${String(d).padStart(2, "0")} · ${dayData(d).weekday.slice(0, 3)}</td><td>${task ? task.title : ""}</td><td>${task ? task.output : ""}</td><td>${task ? task.minutes : 0}m</td><td><span class="badge ${done ? "" : "gray"}">${done ? "COMPLETE" : "PLANNED"}</span></td></tr>`; }).join("")}</tbody></table></div></div>`;
 }
 function ieltsEditor() { return `<section class="card" style="margin-top:14px"><div class="card-head"><div><div class="card-title">IELTS bands · editable evidence</div><div class="card-sub">Keep each skill and overall band current.</div></div></div><div class="form-grid">${["listening", "reading", "writing", "speaking", "overall"].map(k => `<div class="form-field"><label>${k.toUpperCase()} BAND</label><input class="input band-input" data-band="${k}" type="number" min="0" max="9" step=".5" value="${saved.ieltsBands[k] || ""}"></div>`).join("")}</div><button class="settings-save" data-save-band>Save IELTS bands</button></section>`; }
 function outcomeEditor(t) {
   const fields = t === "app" ? [["appStatus", "STATUS", saved.appStatus, "text"], ["users", "USERS", saved.users, "number"], ["videoCount", "VIDEO COUNT", saved.videoCount, "number"]] : t === "channel" ? [["videoCount", "VIDEO COUNT", saved.videoCount, "number"], ["subs", "SUBSCRIBERS", saved.subs, "number"]] : [["applications", "APPLICATIONS", saved.applications, "number"], ["responses", "RESPONSES", saved.responses, "number"], ["screenings", "SCREENINGS", saved.screenings, "number"], ["interviews", "INTERVIEW INVITATIONS", saved.interviews, "number"], ["offers", "OFFERS", saved.offers, "number"]];
   return `<section class="card" style="margin-top:14px"><div class="card-head"><div><div class="card-title">Actual outcome inputs</div><div class="card-sub">Only saved evidence changes outcome progress.</div></div></div><div class="form-grid">${fields.map(f => `<div class="form-field"><label>${f[1]}</label><input class="input outcome-input" data-outcome="${f[0]}" type="${f[3]}" value="${f[2]}"></div>`).join("")}</div><button class="settings-save" data-save-outcomes>Save outcomes</button></section>`;
+}
+function trackSelectOptions(selected = "se") {
+  return Object.entries(tracks).map(([track, meta]) => `<option value="${track}" ${track === selected ? "selected" : ""}>${meta.short} · ${meta.label}</option>`).join("");
+}
+function daySelectOptions(selected = 1) {
+  return Array.from({ length: 28 }, (_, i) => {
+    const day = i + 1;
+    return `<option value="${day}" ${Number(selected) === day ? "selected" : ""}>Day ${String(day).padStart(2, "0")}</option>`;
+  }).join("");
+}
+function prioritySelectOptions(selected = "P1") {
+  return ["P0", "P1", "P2"].map(priority => `<option value="${priority}" ${priority === selected ? "selected" : ""}>${priority}</option>`).join("");
 }
 function analytics() {
   const p = overallPercent();
@@ -450,26 +524,27 @@ function analytics() {
 function reviews() {
   const week = Math.ceil(saved.selectedDay / 7), start = (week - 1) * 7 + 1, days = Array.from({ length: 7 }, (_, i) => start + i), scores = days.map(dayScore), avg = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length), review = saved.reviews.weekly[week] || {};
   const final = saved.selectedDay === 28 ? `<div class="section-title">Final 28-day report</div><section class="card"><table class="table"><thead><tr><th>GOAL</th><th>TARGET</th><th>ACTUAL</th><th>PROGRESS</th><th>STATUS</th></tr></thead><tbody>${Object.entries(tracks).map(([t, x]) => `<tr><td>${x.label}</td><td>${fmt(saved.targets[t])} ${x.unit}</td><td>${fmt(outcomeValue(t))}</td><td>${trackProgress(t)}%</td><td><span class="badge ${trackProgress(t) >= 100 ? "" : "warn"}">${trackProgress(t) >= 100 ? "ACHIEVED" : "BEHIND"}</span></td></tr>`).join("")}</tbody></table><div class="callout"><b>Execution summary:</b> ${completedCount()} / ${allTasks()} outputs completed · ${Math.round(Object.values(saved.minutes).reduce((n, v) => n + Number(v || 0), 0) / 60 * 10) / 10} focused hours.</div></section>` : "";
-  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">REFLECTION LOOP · ALL WEEKS</div><h1>Reviews</h1><p>Daily and weekly reviews persist independently for every day and week.</p></div></div><div class="review-grid"><section class="card review-card"><div class="eyebrow">WEEK ${week} · DAYS ${start}–${start + 6}</div><div class="score-ring" style="background:conic-gradient(var(--green) 0 ${avg}%,#24343a ${avg}% 100%)"><div>${avg}<small style="font-size:11px">/100</small></div></div><h3>Week ${week} review</h3><p>Data-driven average · ${scores.join(" · ")}</p><div class="review-prompts"><label>WHAT IS WORKING?<textarea class="textarea weekly-input" data-weekly="working">${review.working || ""}</textarea></label><label>WHICH GOAL IS BEHIND?<textarea class="textarea weekly-input" data-weekly="behind">${review.behind || ""}</textarea></label><label>WHAT WILL CHANGE NEXT WEEK?<textarea class="textarea weekly-input" data-weekly="change">${review.change || ""}</textarea></label></div><button class="settings-save" data-save-weekly>Save week ${week} review</button></section><section class="card"><div class="card-head"><div><div class="card-title">Daily review log · 28 days</div><div class="card-sub">Every day remains visible, even before it is closed.</div></div></div><table class="table"><thead><tr><th>DAY</th><th>SCORE</th><th>STATUS</th><th>OUTPUTS</th><th>REVIEW</th></tr></thead><tbody>${Array.from({ length: 28 }, (_, i) => { const d = i + 1, r = reviewForDay(d); return `<tr><td>DAY ${String(d).padStart(2, "0")}</td><td>${dayScore(d)} / 100</td><td><span class="badge ${dayScore(d) > 69 ? "" : "warn"}">${dayScore(d) > 69 ? "ON TRACK" : "OPEN"}</span></td><td>${dayData(d).tasks.filter(t => saved.completed[key(d, t.track)]).length} / 6</td><td>${r.win ? "SAVED" : "OPEN"}</td></tr>`; }).join("")}</tbody></table><div class="callout"><b>Scoring weights:</b> SE 15 · AI 15 · IELTS 25 · APP 15 · CHANNEL 15 · JOB 10 · REVIEW 5.</div></section></div>${final}</div>`;
+  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">REFLECTION LOOP · ALL WEEKS</div><h1>Reviews</h1><p>Daily and weekly reviews persist independently for every day and week.</p></div></div><div class="review-grid"><section class="card review-card"><div class="eyebrow">WEEK ${week} · DAYS ${start}–${start + 6}</div><div class="score-ring" style="background:conic-gradient(var(--green) 0 ${avg}%,#24343a ${avg}% 100%)"><div>${avg}<small style="font-size:11px">/100</small></div></div><h3>Week ${week} review</h3><p>Data-driven average · ${scores.join(" · ")}</p><div class="review-prompts"><label>WHAT IS WORKING?<textarea class="textarea weekly-input" data-weekly="working">${review.working || ""}</textarea></label><label>WHICH GOAL IS BEHIND?<textarea class="textarea weekly-input" data-weekly="behind">${review.behind || ""}</textarea></label><label>WHAT WILL CHANGE NEXT WEEK?<textarea class="textarea weekly-input" data-weekly="change">${review.change || ""}</textarea></label></div><button class="settings-save" data-save-weekly>Save week ${week} review</button></section><section class="card"><div class="card-head"><div><div class="card-title">Daily review log · 28 days</div><div class="card-sub">Every day remains visible, even before it is closed.</div></div></div><table class="table"><thead><tr><th>DAY</th><th>SCORE</th><th>STATUS</th><th>OUTPUTS</th><th>REVIEW</th></tr></thead><tbody>${Array.from({ length: 28 }, (_, i) => { const d = i + 1, r = reviewForDay(d), daySchedule = getDaySchedule(d), done = daySchedule.filter((task, index) => !isReviewTask(task) && completedForTask(task, d, index)).length; return `<tr><td>DAY ${String(d).padStart(2, "0")}</td><td>${dayScore(d)} / 100</td><td><span class="badge ${dayScore(d) > 69 ? "" : "warn"}">${dayScore(d) > 69 ? "ON TRACK" : "OPEN"}</span></td><td>${done} / ${daySchedule.length - 1}</td><td>${r.win ? "SAVED" : "OPEN"}</td></tr>`; }).join("")}</tbody></table><div class="callout"><b>Scoring weights:</b> SE 15 · AI 15 · IELTS 25 · APP 15 · CHANNEL 15 · JOB 10 · REVIEW 5.</div></section></div>${final}</div>`;
 }
 function settings() {
   return `<div class="view"><div class="page-heading"><div><div class="eyebrow">SYSTEM CONFIGURATION</div><h1>Settings</h1><p>Change the plan when evidence changes. Protect approximately seven hours of sleep first.</p></div></div><div class="settings-grid"><section class="card"><div class="card-head"><div><div class="card-title">Sprint window</div><div class="card-sub">28 days · ${saved.start} → ${endDate()} · ends on ${dateLabel(28)}</div></div></div><div class="form-grid"><div class="form-field"><label>START DATE</label><input class="input setting" data-setting="start" type="date" value="${saved.start}"></div><div class="form-field"><label>SPRINT LENGTH</label><input class="input" value="28 days" disabled></div></div></section><section class="card"><div class="card-head"><div><div class="card-title">Daily schedule</div><div class="card-sub">Default sleep: ${sleepHours()}h. Settings are staged until Save configuration.</div></div></div><div class="form-grid">${[["wake", "WAKE TIME"], ["sleep", "SLEEP TIME"], ["workBlock", "WORK BLOCK (MIN)"], ["break", "BREAK (MIN)"]].map(x => `<div class="form-field"><label>${x[1]}</label><input class="input setting" data-setting="${x[0]}" value="${saved.settings[x[0]]}"></div>`).join("")}</div></section><section class="card"><div class="card-head"><div><div class="card-title">Live outcome inputs</div><div class="card-sub">Update actuals as the sprint produces evidence.</div></div></div><div class="form-grid">${[["appStatus", "APP STATUS", saved.appStatus, "text"], ["users", "APP USERS", saved.users, "number"], ["videoCount", "VIDEO COUNT", saved.videoCount, "number"], ["subs", "CHANNEL SUBSCRIBERS", saved.subs, "number"], ["applications", "APPLICATIONS", saved.applications, "number"], ["responses", "RESPONSES", saved.responses, "number"], ["screenings", "SCREENINGS", saved.screenings, "number"], ["interviews", "INTERVIEW INVITATIONS", saved.interviews, "number"], ["offers", "OFFERS", saved.offers, "number"]].map(x => `<div class="form-field"><label>${x[1]}</label><input class="input outcome-input" data-outcome="${x[0]}" type="${x[3]}" min="0" value="${x[2]}"></div>`).join("")}</div><button class="settings-save" data-save-settings>Save configuration</button></section><section class="card"><div class="card-head"><div><div class="card-title">Targets & scoring</div><div class="card-sub">Adjust outcome targets and daily score weights.</div></div></div><div class="form-grid">${Object.keys(tracks).map(t => `<div class="form-field"><label>${tracks[t].short} TARGET (${tracks[t].unit})</label><input class="input target-input" data-target="${t}" type="number" min="0" value="${saved.targets[t]}"></div>`).join("")}${Object.keys(tracks).map(t => `<div class="form-field"><label>${tracks[t].short} WEIGHT</label><input class="input weight-input" data-weight="${t}" type="number" min="0" max="100" value="${saved.weights[t]}"></div>`).join("")}</div><button class="settings-save" data-save-settings>Save targets & scoring</button></section><section class="card"><div class="card-head"><div><div class="card-title">Gemini AI Assistant</div><div class="card-sub">Add your Gemini API key to get AI schedule suggestions.</div></div></div><div class="form-grid"><div class="form-field"><label>GEMINI API KEY</label><input class="input setting" data-setting="geminiKey" type="password" value="${saved.geminiKey}"></div></div><button class="settings-save" data-save-settings>Save Gemini key</button></section><section class="card"><div class="card-head"><div><div class="card-title">Product rules</div><div class="card-sub">Non-negotiables encoded in the tracker.</div></div></div><div class="stat-list"><div class="stat-line"><span>Technical tracks</span><b>SE + AI in parallel</b></div><div class="stat-line"><span>IELTS baseline</span><b>Actual diagnostic only</b></div><div class="stat-line"><span>App / channel</span><b>Status + users + videos</b></div><div class="stat-line"><span>Job funnel</span><b>Responses → screenings → offers</b></div><div class="stat-line"><span>Sleep protection</span><b>Enabled</b></div></div></section></div></div>`;
 }
 function schedule() {
   const d = saved.selectedDay;
-  const dayTasks = dayData(d).tasks;
-  const rawSchedule = saved.schedule[d] || ScheduleEngine.generateDaySchedule(d, dayTasks, saved.settings);
-  const daySchedule = rawSchedule.map(task => {
-    const base = dayTasks.find(item => item.track === task.track) || task;
-    const custom = saved.taskEdits?.[d]?.[task.track] || {};
-    return { ...base, ...task, title: custom.title || base.title, docs: custom.docs || base.docs, output: custom.output || base.output };
-  });
+  const daySchedule = getDaySchedule(d);
   const suggestions = ScheduleEngine.suggestOptimization(daySchedule, d);
   const totalDuration = ScheduleEngine.getTotalDuration(daySchedule);
   const lastTask = daySchedule[daySchedule.length - 1];
   const endTime = lastTask ? lastTask.endTime : saved.settings.sleep;
-  
-  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">DAILY EXECUTION</div><h1>Schedule – Day ${d}</h1><p>Sửa giờ bắt đầu hoặc thời lượng ngay trên từng dòng. Timeline sẽ tự dời các task phía sau để giữ nhịp ngày.</p></div><div class="day-switch"><button data-prev-schedule>‹</button><span>${dateLabel(d)}</span><button data-next-schedule>›</button></div></div><div class="schedule-header"><h2>${dateLabel(d)}</h2><div class="schedule-controls"><button data-ai-optimize>🤖 AI Optimize</button><button data-reset-schedule>↻ Reset</button></div></div><div class="schedule-toolbar"><div class="schedule-pill">Wake ${saved.settings.wake || "06:30"}</div><div class="schedule-pill">Break ${saved.settings.break || 30}m</div><div class="schedule-pill">End ${endTime}</div><span class="draggable-hint">Drag rows to reorder. Edit start time or duration để cập nhật timeline.</span></div>${suggestions.length > 0 ? `<div class="ai-suggestions"><div class="ai-suggestions-title"><span class="ai-icon">💡</span>AI Suggestions</div>${suggestions.map(s => `<div class="suggestion-item"><div class="suggestion-type">${s.type}</div><div class="suggestion-msg">${s.message}</div><div class="suggestion-rec">${s.recommendation}</div></div>`).join("")}</div>` : ""}<table class="schedule-table"><thead><tr><th>START</th><th>TASK</th><th>DOCS</th><th style="width:86px">PRIORITY</th><th style="width:110px">DURATION</th><th style="width:64px">✓</th></tr></thead><tbody>${daySchedule.map((task, i) => `<tr class="task-row" draggable="true" data-task-index="${i}"><td class="time-cell"><input class="input schedule-input" data-schedule-start="${i}" type="time" value="${task.startTime}"><span class="time-range">${task.startTime} — ${task.endTime}</span></td><td class="task-cell"><div class="task-title">${task.title}</div><div class="task-output">${task.output}</div></td><td class="task-doc-cell">${task.docs || ""}</td><td><span class="priority-badge ${task.priority.toLowerCase()}">${task.priority}</span></td><td class="duration-cell"><input class="input schedule-input duration-input" data-schedule-minutes="${i}" type="number" min="15" step="5" value="${task.minutes}"><span>${task.minutes}m</span></td><td class="status-cell"><input type="checkbox" class="check inline" ${saved.completed[key(d, task.track)] ? "checked" : ""} data-task-complete="${key(d, task.track)}"></td></tr>`).join("")}</tbody></table><div class="total-time"><span>Total time on tasks:</span><span class="total-time-value">${Math.floor(totalDuration / 60)}h ${totalDuration % 60}m</span></div><div class="schedule-footer"><p><strong>Gợi ý sử dụng:</strong></p><ul><li>Kéo dòng để đổi thứ tự ưu tiên.</li><li>Chỉnh START hoặc DURATION để timeline tự tính lại phần còn lại.</li><li>P0 nên ở đầu buổi sáng để tận dụng năng lượng tốt nhất.</li><li>Nhấn AI Optimize nếu muốn nhận gợi ý sắp xếp lại.</li><li>Tick task khi đã xong output thực tế.</li></ul></div></div>`;
+  const addForm = `<div class="schedule-create"><div class="form-grid"><div class="form-field"><label>TASK TITLE</label><input class="input schedule-new" data-new-task-title placeholder="Mô tả task mới"></div><div class="form-field"><label>TAG</label><select class="select schedule-new" data-new-task-track>${trackSelectOptions("se")}</select></div><div class="form-field"><label>DOCS</label><input class="input schedule-new" data-new-task-docs placeholder="Tài liệu / nguồn tham khảo"></div><div class="form-field"><label>EXPECTED OUTPUT</label><input class="input schedule-new" data-new-task-output placeholder="Kết quả cần nộp"></div><div class="form-field"><label>DURATION (MIN)</label><input class="input schedule-new" data-new-task-minutes type="number" min="15" step="5" value="60"></div><div class="form-field"><label>PRIORITY</label><select class="select schedule-new" data-new-task-priority>${prioritySelectOptions("P1")}</select></div></div><button class="ai-button" data-add-task>+ Add task to Day ${String(d).padStart(2, "0")}</button></div>`;
+  const rows = daySchedule.map((task, i) => {
+    const done = completedForTask(task, d, i);
+    const taskIdValue = taskKey(task, d, i);
+    const canEdit = !isReviewTask(task);
+    const lockNote = canEdit ? "" : '<span class="schedule-pill">Locked review</span>';
+    return `<tr class="task-row ${isReviewTask(task) ? "review-row" : ""}" draggable="${canEdit ? "true" : "false"}" data-task-index="${i}" data-task-id="${taskIdValue}"><td class="time-cell"><input class="input schedule-input" data-schedule-start="${i}" type="time" value="${task.startTime}"><span class="time-range">${task.startTime} — ${task.endTime}</span></td><td class="task-cell"><div class="task-title">${task.title}</div><div class="task-output">${task.output}</div><div class="schedule-mini-controls"><span class="task-tag">${tracks[task.track] ? tracks[task.track].short : task.track}</span><select class="select schedule-select" data-schedule-track="${i}" ${canEdit ? "" : "disabled"}>${trackSelectOptions(task.track)}</select><select class="select schedule-select" data-schedule-move-day="${i}" ${canEdit ? "" : "disabled"}>${daySelectOptions(d)}</select><button class="outline-btn" data-schedule-delete="${i}" ${canEdit ? "" : "disabled"}>Delete</button>${lockNote}</div></td><td class="task-doc-cell">${task.docs || ""}</td><td><span class="priority-badge ${task.priority.toLowerCase()}">${task.priority}</span></td><td class="duration-cell"><input class="input schedule-input duration-input" data-schedule-minutes="${i}" type="number" min="15" step="5" value="${task.minutes}"><span>${task.minutes}m</span></td><td class="status-cell"><input type="checkbox" class="check inline" ${done ? "checked" : ""} data-task-complete="${taskIdValue}"></td></tr>`;
+  }).join("");
+  return `<div class="view"><div class="page-heading"><div><div class="eyebrow">DAILY EXECUTION</div><h1>Schedule – Day ${d}</h1><p>Sửa giờ bắt đầu hoặc thời lượng ngay trên từng dòng. Timeline sẽ tự dời các task phía sau để giữ nhịp ngày.</p></div><div class="day-switch"><button data-prev-schedule>‹</button><span>${dateLabel(d)}</span><button data-next-schedule>›</button></div></div><div class="schedule-header"><h2>${dateLabel(d)}</h2><div class="schedule-controls"><button data-ai-optimize>🤖 AI Optimize</button><button data-reset-schedule>↻ Reset</button></div></div><div class="schedule-toolbar"><div class="schedule-pill">Wake ${saved.settings.wake || "06:30"}</div><div class="schedule-pill">Break ${saved.settings.break || 30}m</div><div class="schedule-pill">End ${endTime}</div><span class="draggable-hint">Drag rows to reorder. Edit start time, duration, tag, or move task to another day.</span></div>${addForm}${suggestions.length > 0 ? `<div class="ai-suggestions"><div class="ai-suggestions-title"><span class="ai-icon">💡</span>AI Suggestions</div>${suggestions.map(s => `<div class="suggestion-item"><div class="suggestion-type">${s.type}</div><div class="suggestion-msg">${s.message}</div><div class="suggestion-rec">${s.recommendation}</div></div>`).join("")}</div>` : ""}<table class="schedule-table"><thead><tr><th>START</th><th>TASK</th><th>DOCS</th><th style="width:86px">PRIORITY</th><th style="width:110px">DURATION</th><th style="width:64px">✓</th></tr></thead><tbody>${rows}</tbody></table><div class="total-time"><span>Total time on tasks:</span><span class="total-time-value">${Math.floor(totalDuration / 60)}h ${totalDuration % 60}m</span></div><div class="schedule-footer"><p><strong>Gợi ý sử dụng:</strong></p><ul><li>Kéo dòng để đổi thứ tự ưu tiên.</li><li>Chỉnh START hoặc DURATION để timeline tự tính lại phần còn lại.</li><li>Tag của mỗi task nằm ngay trong dòng task để dễ kiểm tra.</li><li>Nhấn AI Optimize nếu muốn nhận gợi ý sắp xếp lại.</li><li>Tick task khi đã xong output thực tế.</li></ul></div></div>`;
 }
 const views = { dashboard, today, schedule, calendar, analytics, reviews, settings, se: () => trackPage("se"), ai: () => trackPage("ai"), ielts: () => trackPage("ielts"), app: () => trackPage("app"), channel: () => trackPage("channel"), jobs: () => trackPage("jobs") };
 function headerTitle(view) { return ({ dashboard: "Tổng quan", calendar: "Lịch 28 ngày", today: "Hôm nay", schedule: "Lịch làm việc", se: "Software Engineering", ai: "Artificial Intelligence", ielts: "IELTS", app: "Phát hành App", channel: "Kênh cá nhân", jobs: "Tìm việc", analytics: "Phân tích", reviews: "Tổng kết", settings: "Cài đặt" })[view] || "Tổng quan"; }
@@ -503,23 +578,78 @@ function setupScheduleEditors() {
 function render(view = "dashboard") { const active = document.querySelector(".nav-item.active"); if (active && view === "dashboard") view = active.dataset.view; document.querySelector("#page-label").textContent = headerTitle(view); document.querySelector("#view-root").innerHTML = localizeHtml((views[view] || views.dashboard)()); updateChrome(); if (view === "schedule") setupScheduleEditors(); }
 function updateChrome() { const p = overallPercent(); document.querySelector("#mini-progress").style.width = `${p}%`; document.querySelector("#mini-percent").textContent = `${p}%`; document.querySelector("#mini-day").textContent = `DAY ${String(saved.selectedDay).padStart(2, "0")} / 28`; document.querySelector("#sprint-dates").textContent = `${saved.start} → ${endDate()}`; }
 function readOutcome(input) { return input.type === "number" ? Math.max(0, Number(input.value) || 0) : input.value.trim(); }
+function saveScheduleAndRefresh(day, schedule, message) {
+  saveDaySchedule(day, schedule);
+  persist();
+  render("schedule");
+  showToast(message);
+}
 function applyTimelineEdit(day, index, updates) {
-  const current = saved.schedule[day] || ScheduleEngine.generateDaySchedule(day, dayData(day).tasks, saved.settings);
-  saved.schedule[day] = ScheduleEngine.updateTaskAt(current, index, updates, saved.settings);
+  const current = getDaySchedule(day);
+  saveDaySchedule(day, ScheduleEngine.updateTaskAt(current, index, updates, saved.settings));
   persist();
   render("schedule");
   showToast("Đã cập nhật timeline");
 }
 function applyTaskEdit(day, index, updates) {
-  const current = saved.schedule[day] || ScheduleEngine.generateDaySchedule(day, dayData(day).tasks, saved.settings);
+  const current = getDaySchedule(day);
   const task = current[index];
   if (!task) return;
-  saved.schedule[day] = current.map((item, i) => i === index ? { ...item, ...updates } : item);
-  saved.taskEdits[day] = saved.taskEdits[day] || {};
-  saved.taskEdits[day][task.track] = { ...(saved.taskEdits[day][task.track] || {}), ...updates };
+  const next = current.map((item, i) => i === index ? { ...item, ...updates } : item);
+  saveDaySchedule(day, next);
+  if (task.track !== "review") {
+    saved.taskEdits[day] = saved.taskEdits[day] || {};
+    saved.taskEdits[day][task.track] = { ...(saved.taskEdits[day][task.track] || {}), ...updates };
+  }
   persist();
   render("schedule");
   showToast("Đã cập nhật task");
+}
+function addTaskToDay(day, payload) {
+  const current = getDaySchedule(day).slice();
+  const reviewIndex = current.findIndex(task => task.track === "review");
+  const insertAt = reviewIndex >= 0 ? reviewIndex : current.length;
+  const newTask = {
+    id: `custom-${day}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    track: payload.track || "se",
+    title: payload.title || "Custom task",
+    docs: payload.docs || "",
+    output: payload.output || "Expected output",
+    minutes: Math.max(15, Number(payload.minutes) || 60),
+    priority: payload.priority || "P1"
+  };
+  current.splice(insertAt, 0, newTask);
+  saveScheduleAndRefresh(day, ScheduleEngine.recalculateTimes(current, saved.settings), "Đã thêm task mới");
+}
+function deleteTaskFromDay(day, index) {
+  const current = getDaySchedule(day).slice();
+  const task = current[index];
+  if (!task || isReviewTask(task)) return;
+  current.splice(index, 1);
+  saveScheduleAndRefresh(day, ScheduleEngine.recalculateTimes(current, saved.settings), "Đã xóa task");
+}
+function moveTaskToDay(fromDay, index, toDay) {
+  const source = getDaySchedule(fromDay).slice();
+  const task = source[index];
+  if (!task || isReviewTask(task)) return;
+  source.splice(index, 1);
+  saveDaySchedule(fromDay, ScheduleEngine.recalculateTimes(source, saved.settings));
+  const target = getDaySchedule(toDay).slice();
+  const reviewIndex = target.findIndex(item => item.track === "review");
+  const insertAt = reviewIndex >= 0 ? reviewIndex : target.length;
+  target.splice(insertAt, 0, task);
+  saveDaySchedule(toDay, ScheduleEngine.recalculateTimes(target, saved.settings));
+  saved.selectedDay = Number(toDay);
+  persist();
+  render("schedule");
+  showToast(`Đã chuyển task sang Day ${String(toDay).padStart(2, "0")}`);
+}
+function retagTask(day, index, track) {
+  const current = getDaySchedule(day).slice();
+  const task = current[index];
+  if (!task || isReviewTask(task)) return;
+  current[index] = { ...task, track };
+  saveScheduleAndRefresh(day, current, "Đã đổi tag task");
 }
 /* One delegated listener set survives every render; this avoids accumulating
    handlers on controls that are replaced by innerHTML. */
@@ -530,7 +660,20 @@ function bindEvents() {
     const prevSched = e.target.closest("[data-prev-schedule]"); if (prevSched) { saved.selectedDay = Math.max(1, saved.selectedDay - 1); persist(); render("schedule"); return; }
     const nextSched = e.target.closest("[data-next-schedule]"); if (nextSched) { saved.selectedDay = Math.min(28, saved.selectedDay + 1); persist(); render("schedule"); return; }
     const select = e.target.closest("[data-select-day]"); if (select) { saved.selectedDay = Number(select.dataset.selectDay); document.querySelectorAll(".nav-item").forEach(x => x.classList.toggle("active", x.dataset.view === "today")); persist(); render("today"); return; }
-    const task = e.target.closest("[data-task]"); if (task) { saved.completed[key(saved.selectedDay, task.dataset.task)] = !saved.completed[key(saved.selectedDay, task.dataset.task)]; saveAndRender("Đã lưu trạng thái task"); return; }
+    const addTask = e.target.closest("[data-add-task]"); if (addTask) {
+      const root = addTask.closest(".schedule-create") || document;
+      addTaskToDay(saved.selectedDay, {
+        title: root.querySelector("[data-new-task-title]")?.value?.trim(),
+        track: root.querySelector("[data-new-task-track]")?.value || "se",
+        docs: root.querySelector("[data-new-task-docs]")?.value?.trim(),
+        output: root.querySelector("[data-new-task-output]")?.value?.trim(),
+        minutes: root.querySelector("[data-new-task-minutes]")?.value,
+        priority: root.querySelector("[data-new-task-priority]")?.value || "P1"
+      });
+      return;
+    }
+    const deleteTask = e.target.closest("[data-schedule-delete]"); if (deleteTask) { deleteTaskFromDay(saved.selectedDay, Number(deleteTask.dataset.scheduleDelete)); return; }
+    const task = e.target.closest("[data-task]"); if (task) { const k = task.dataset.task; saved.completed[k] = !saved.completed[k]; saveAndRender("Đã lưu trạng thái task"); return; }
     const taskComplete = e.target.closest("[data-task-complete]"); if (taskComplete) { const k = taskComplete.dataset.taskComplete; saved.completed[k] = taskComplete.checked; persist(); showToast("Đã lưu trạng thái task"); return; }
     const resetSched = e.target.closest("[data-reset-schedule]"); if (resetSched) { delete saved.schedule[saved.selectedDay]; saveAndRender("Đã đặt lại lịch mặc định"); return; }
     const aiOptimize = e.target.closest("[data-ai-optimize]"); if (aiOptimize) { aiOptimize.disabled = true; aiOptimize.textContent = "🤖 Optimizing..."; optimizeScheduleWithAI().then(() => render("schedule")).finally(() => { aiOptimize.disabled = false; aiOptimize.textContent = "🤖 AI Optimize"; }); return; }
@@ -540,13 +683,15 @@ function bindEvents() {
     if (e.target.closest("[data-save-band]")) { document.querySelectorAll("[data-band]").forEach(i => saved.ieltsBands[i.dataset.band] = Number(i.value) || 0); saveAndRender("IELTS bands saved"); }
   });
   document.addEventListener("change", e => {
-    const min = e.target.closest("[data-minutes]"); if (min) { saved.minutes[key(saved.selectedDay, min.dataset.minutes)] = Math.max(0, Number(min.value) || 0); persist(); showToast("Actual time recorded"); return; }
-    const evidence = e.target.closest("[data-evidence]"); if (evidence) { saved.evidence[key(saved.selectedDay, evidence.dataset.evidence)] = evidence.value; persist(); showToast("Evidence note saved"); }
+    const min = e.target.closest("[data-minutes]"); if (min) { saved.minutes[min.dataset.minutes] = Math.max(0, Number(min.value) || 0); persist(); showToast("Actual time recorded"); return; }
+    const evidence = e.target.closest("[data-evidence]"); if (evidence) { saved.evidence[evidence.dataset.evidence] = evidence.value; persist(); showToast("Evidence note saved"); }
     const scheduleStart = e.target.closest("[data-schedule-start]"); if (scheduleStart) { applyTimelineEdit(saved.selectedDay, Number(scheduleStart.dataset.scheduleStart), { startTime: scheduleStart.value }); return; }
     const scheduleMinutes = e.target.closest("[data-schedule-minutes]"); if (scheduleMinutes) { applyTimelineEdit(saved.selectedDay, Number(scheduleMinutes.dataset.scheduleMinutes), { minutes: scheduleMinutes.value }); return; }
     const taskTitle = e.target.closest("[data-schedule-title]"); if (taskTitle) { applyTaskEdit(saved.selectedDay, Number(taskTitle.dataset.scheduleTitle), { title: taskTitle.value }); return; }
     const taskDocs = e.target.closest("[data-schedule-docs]"); if (taskDocs) { applyTaskEdit(saved.selectedDay, Number(taskDocs.dataset.scheduleDocs), { docs: taskDocs.value }); return; }
     const taskOutput = e.target.closest("[data-schedule-output]"); if (taskOutput) { applyTaskEdit(saved.selectedDay, Number(taskOutput.dataset.scheduleOutput), { output: taskOutput.value }); return; }
+    const taskTrack = e.target.closest("[data-schedule-track]"); if (taskTrack) { retagTask(saved.selectedDay, Number(taskTrack.dataset.scheduleTrack), taskTrack.value); return; }
+    const moveDay = e.target.closest("[data-schedule-move-day]"); if (moveDay && Number(moveDay.value) !== saved.selectedDay) { moveTaskToDay(saved.selectedDay, Number(moveDay.dataset.scheduleMoveDay), Number(moveDay.value)); return; }
   });
   document.addEventListener("focusout", e => {
     const field = e.target.closest("[data-schedule-edit]");
@@ -573,10 +718,9 @@ function bindEvents() {
       e.preventDefault();
       const toIndex = Number(row.dataset.taskIndex);
       const d = saved.selectedDay;
-      const dayTasks = dayData(d).tasks;
-      const daySchedule = saved.schedule[d] || ScheduleEngine.generateDaySchedule(d, dayTasks, saved.settings);
+      const daySchedule = getDaySchedule(d);
       const newSchedule = ScheduleEngine.moveTask(daySchedule, draggedIndex, toIndex, saved.settings);
-      saved.schedule[d] = newSchedule;
+      saveDaySchedule(d, newSchedule);
       saveAndRender("Schedule reordered");
       draggedIndex = null;
     }
@@ -586,8 +730,7 @@ async function optimizeScheduleWithAI() {
   if (!saved.geminiKey) { showToast("⚠ Gemini API key not set. Go to Settings to add it."); return; }
   GeminiAI.init(saved.geminiKey);
   const d = saved.selectedDay;
-  const dayTasks = dayData(d).tasks;
-  const daySchedule = saved.schedule[d] || ScheduleEngine.generateDaySchedule(d, dayTasks, saved.settings);
+  const daySchedule = getDaySchedule(d);
   const result = await GeminiAI.suggestScheduleOptimization(d, d, daySchedule);
   if (result.error) { showToast(`❌ ${result.error}`); return; }
   showToast("💡 AI suggestions updated");
